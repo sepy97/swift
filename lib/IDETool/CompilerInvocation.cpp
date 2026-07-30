@@ -102,8 +102,14 @@ static FrontendInputsAndOutputs resolveSymbolicLinksInInputs(
     if (auto err = FileSystem->getRealPath(input.getFileName(), newFilename))
       newFilename = input.getFileName();
     llvm::sys::path::native(newFilename);
-    bool newIsPrimary = input.isPrimary() ||
-                        (!PrimaryFile.empty() && PrimaryFile == newFilename);
+    // If the caller named a primary file, it wins, and any '-primary-file' in
+    // the arguments is ignored. This matters for frontend arguments, which
+    // routinely designate a primary of their own; driver arguments never do,
+    // because getSingleFrontendInvocationFromDriverArguments forces
+    // -whole-module-optimization. Behavior is unchanged when the caller names
+    // no primary.
+    bool newIsPrimary = PrimaryFile.empty() ? input.isPrimary()
+                                            : (PrimaryFile == newFilename);
     if (newIsPrimary) {
       ++primaryCount;
     }
@@ -154,50 +160,27 @@ public:
 };
 } // end anonymous namespace
 
-bool ide::initCompilerInvocation(
-    CompilerInvocation &Invocation, ArrayRef<const char *> OrigArgs,
-    FrontendOptions::ActionType Action, DiagnosticEngine &Diags,
+/// Applies the policy that must hold for every SourceKit invocation, however
+/// its arguments were spelled: this compilation exists to answer editor
+/// queries, not to produce build products.
+///
+/// Both \c ide::initCompilerInvocation and
+/// \c ide::initCompilerInvocationFromFrontendArgs funnel through here, so that
+/// features behave identically regardless of which one produced \p Invocation.
+///
+/// \returns true on error, and appends to \p Error.
+static bool applySourceKitInvocationPolicy(
+    CompilerInvocation &Invocation, FrontendOptions::ActionType Action,
     StringRef UnresolvedPrimaryFile,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
-    const std::string &swiftExecutablePath,
-    const std::string &runtimeResourcePath, time_t sessionTimestamp,
-    std::string &Error) {
-  SmallVector<const char *, 16> Args;
-  // Make sure to put '-resource-dir' at the top to allow overriding them with
-  // the passed in arguments.
-  Args.push_back("-resource-dir");
-  Args.push_back(runtimeResourcePath.c_str());
-  Args.append(OrigArgs.begin(), OrigArgs.end());
-
-  SmallString<32> ErrStr;
-  llvm::raw_svector_ostream ErrOS(ErrStr);
-  StreamDiagConsumer DiagConsumer(ErrOS);
-  Diags.addConsumer(DiagConsumer);
-
-  // Derive 'swiftc' path from 'swift-frontend' path (swiftExecutablePath).
-  SmallString<256> driverPath(swiftExecutablePath);
-  llvm::sys::path::remove_filename(driverPath);
-  llvm::sys::path::append(driverPath, "swiftc");
-
-  bool InvocationCreationFailed =
-      driver::getSingleFrontendInvocationFromDriverArguments(
-          driverPath, Args, Diags,
-          [&](ArrayRef<const char *> FrontendArgs) {
-            return Invocation.parseArgs(
-                FrontendArgs, Diags, /*ConfigurationFileBuffers=*/nullptr,
-                /*workingDirectory=*/"", swiftExecutablePath);
-          },
-          /*ForceNoOutputs=*/true);
-
-  // Remove the StreamDiagConsumer as it's no longer needed.
-  Diags.removeConsumer(DiagConsumer);
-
-  Error = std::string(ErrOS.str());
-  if (InvocationCreationFailed) {
-    return true;
-  }
-
+    time_t sessionTimestamp, std::string &Error) {
   std::string SymlinkResolveError;
+  // NOTE: rebuilding the inputs also drops every main and supplementary output
+  // path, because InputFile's 3-argument constructor resets the
+  // PrimarySpecificPaths. That is what keeps us from writing build products
+  // when the arguments came from a real compile job, which is the textual
+  // '-emit-module'/supplementary-output stripping that
+  // getSingleFrontendInvocationFromDriverArguments does with ForceNoOutputs.
   Invocation.getFrontendOptions().InputsAndOutputs =
       resolveSymbolicLinksInInputs(
           Invocation.getFrontendOptions().InputsAndOutputs,
@@ -265,6 +248,119 @@ bool ide::initCompilerInvocation(
   disableExpensiveSILOptions(Invocation.getSILOptions());
 
   return false;
+}
+
+bool ide::initCompilerInvocation(
+    CompilerInvocation &Invocation, ArrayRef<const char *> OrigArgs,
+    FrontendOptions::ActionType Action, DiagnosticEngine &Diags,
+    StringRef UnresolvedPrimaryFile,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
+    const std::string &swiftExecutablePath,
+    const std::string &runtimeResourcePath, time_t sessionTimestamp,
+    std::string &Error) {
+  SmallVector<const char *, 16> Args;
+  // Make sure to put '-resource-dir' at the top to allow overriding them with
+  // the passed in arguments.
+  Args.push_back("-resource-dir");
+  Args.push_back(runtimeResourcePath.c_str());
+  Args.append(OrigArgs.begin(), OrigArgs.end());
+
+  SmallString<32> ErrStr;
+  llvm::raw_svector_ostream ErrOS(ErrStr);
+  StreamDiagConsumer DiagConsumer(ErrOS);
+  Diags.addConsumer(DiagConsumer);
+
+  // Derive 'swiftc' path from 'swift-frontend' path (swiftExecutablePath).
+  SmallString<256> driverPath(swiftExecutablePath);
+  llvm::sys::path::remove_filename(driverPath);
+  llvm::sys::path::append(driverPath, "swiftc");
+
+  bool InvocationCreationFailed =
+      driver::getSingleFrontendInvocationFromDriverArguments(
+          driverPath, Args, Diags,
+          [&](ArrayRef<const char *> FrontendArgs) {
+            return Invocation.parseArgs(
+                FrontendArgs, Diags, /*ConfigurationFileBuffers=*/nullptr,
+                /*workingDirectory=*/"", swiftExecutablePath);
+          },
+          /*ForceNoOutputs=*/true);
+
+  // Remove the StreamDiagConsumer as it's no longer needed.
+  Diags.removeConsumer(DiagConsumer);
+
+  Error = std::string(ErrOS.str());
+  if (InvocationCreationFailed) {
+    return true;
+  }
+
+  return applySourceKitInvocationPolicy(Invocation, Action,
+                                        UnresolvedPrimaryFile, FileSystem,
+                                        sessionTimestamp, Error);
+}
+
+bool ide::initCompilerInvocationFromFrontendArgs(
+    CompilerInvocation &Invocation, ArrayRef<const char *> OrigArgs,
+    FrontendOptions::ActionType Action, DiagnosticEngine &Diags,
+    StringRef UnresolvedPrimaryFile,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
+    const std::string &swiftExecutablePath,
+    const std::string &runtimeResourcePath, time_t sessionTimestamp,
+    std::string &Error) {
+  // Accept a frontend job's argument list verbatim, which begins with
+  // '-frontend'. CompilerInvocation::parseArgs does not expect it (the driver
+  // path drops it before handing the arguments over), so drop it here.
+  if (!OrigArgs.empty() && StringRef(OrigArgs.front()) == "-frontend")
+    OrigArgs = OrigArgs.drop_front();
+
+  SmallVector<const char *, 16> Args;
+  // Make sure to put '-resource-dir' at the top to allow overriding it with the
+  // passed in arguments.
+  Args.push_back("-resource-dir");
+  Args.push_back(runtimeResourcePath.c_str());
+  Args.append(OrigArgs.begin(), OrigArgs.end());
+
+  // The driver expands response files on the other path; frontend arguments can
+  // use them too, so do the same here.
+  llvm::BumpPtrAllocator Allocator;
+  llvm::StringSaver Saver(Allocator);
+  driver::ExpandResponseFilesWithRetry(Saver, Args);
+
+  SmallString<32> ErrStr;
+  llvm::raw_svector_ostream ErrOS(ErrStr);
+  StreamDiagConsumer DiagConsumer(ErrOS);
+  Diags.addConsumer(DiagConsumer);
+
+  // Unlike initCompilerInvocation, no driver is involved: these arguments are
+  // already what the frontend expects. That is the whole point of this entry
+  // point, because frontend-only flags (e.g.
+  // '-explicit-swift-module-map-file') cannot be expressed as driver arguments,
+  // and the driver cannot derive them either.
+  bool ParseFailed =
+      Invocation.parseArgs(Args, Diags, /*ConfigurationFileBuffers=*/nullptr,
+                           /*workingDirectory=*/"", swiftExecutablePath);
+
+  // Remove the StreamDiagConsumer as it's no longer needed.
+  Diags.removeConsumer(DiagConsumer);
+
+  Error = std::string(ErrOS.str());
+  if (ParseFailed) {
+    return true;
+  }
+
+  // A caller-supplied primary file overrides whatever the arguments designate,
+  // so multiple '-primary-file's are only a problem when there is no such
+  // caller preference. Diagnose rather than trip the one-primary assertion in
+  // resolveSymbolicLinksInInputs.
+  if (UnresolvedPrimaryFile.empty() &&
+      Invocation.getFrontendOptions()
+          .InputsAndOutputs.hasMultiplePrimaryInputs()) {
+    Error += "frontend arguments must not specify more than one -primary-file";
+    return true;
+  }
+
+  return applySourceKitInvocationPolicy(Invocation, Action,
+                                        UnresolvedPrimaryFile, FileSystem,
+                                        sessionTimestamp, Error);
 }
 
 bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
